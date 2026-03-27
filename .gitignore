@@ -1,3 +1,17 @@
-.idea/
-.venv/
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment variables
+.env
