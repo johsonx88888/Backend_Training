@@ -15,3 +15,7 @@ venv/
 
 # Environment variables
 .env
+
+# Database files
+chroma_db/
+chat.db
