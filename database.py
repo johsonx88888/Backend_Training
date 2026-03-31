@@ -1,6 +1,8 @@
 #数据库操作块
 import aiosqlite
 DATABASE="chat.db"  #数据库文件名
+
+#连库建表
 async def init_db():
     """初始化数据库"""
     async with aiosqlite.connect(DATABASE) as db:
@@ -14,6 +16,7 @@ async def init_db():
         """)
         await db.commit()
 
+#保存消息
 async def save_message(role:str,content:str):
     """保存消息到数据库"""
     async with aiosqlite.connect(DATABASE) as db:
@@ -23,6 +26,7 @@ async def save_message(role:str,content:str):
         )
         await db.commit()
 
+#获取历史消息记录
 async def get_history(limit: int =20):
     """获取历史消息"""
     async with aiosqlite.connect(DATABASE) as db:
