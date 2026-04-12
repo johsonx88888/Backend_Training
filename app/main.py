@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 import os
@@ -17,6 +18,15 @@ from rag import search_documents, init_rag_data
 load_env_file()
 
 app = FastAPI()
+
+# 配置 CORS，允许所有来源访问（开发环境用，生产环境建议限制具体域名）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有方法
+    allow_headers=["*"],  # 允许所有请求头
+)
 
 # AI 客户端配置（连接硅基流动大模型服务）
 ai_client = OpenAI(
@@ -69,7 +79,11 @@ async def chat(request: ChatRequest):
     # 返回流式响应
     return StreamingResponse(
         generate_ai_response(request.user_id,request.session_id,request.message),
-        media_type="text/plain"  # 纯文本流式输出
+        media_type="text/plain",  # 纯文本流式输出
+        headers={
+            "Cache-Control": "no-cache",  # 禁用缓存，确保实时输出
+            "X-Accel-Buffering": "no"     # 禁用 Nginx 等代理的缓冲
+        }
     )
 
 
@@ -116,7 +130,8 @@ async def generate_ai_response(user_id: str, session_id: str, message: str):
         full_reply = ""
         for chunk in response:
             # 获取当前片段的内容
-            content = chunk.choices[0].delta.content
+            delta = chunk.choices[0].delta
+            content = delta.content if delta else None
             if content:
                 full_reply += content
                 yield content  # 逐字返回给前端
