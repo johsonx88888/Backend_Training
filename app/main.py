@@ -75,9 +75,7 @@ async def chat(request: ChatRequest):
 
 async def generate_ai_response(user_id: str, session_id: str, message: str):
     """流式生成 AI 回复，带RAG检索和异常处理"""
-    # 先把用户消息存了（不管AI是否成功，用户消息都要记录）
-    append_to_memory(user_id, session_id, "user", message)
-    await save_message(user_id, session_id, "user", message)
+    # 注意：用户消息已在 chat() 函数中保存，这里不再重复保存
     
     try:
         # Step 1:先读短期记忆
