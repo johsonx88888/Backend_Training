@@ -3,8 +3,14 @@ from pydantic import BaseModel
 from openai import OpenAI
 import os
 from dotenv import load_dotenv as load_env_file
-from database import init_db,save_message,get_history
 from fastapi.responses import StreamingResponse
+from database import (
+    init_db, save_message, get_history,
+    get_hisory_from_memory, append_to_memory, clear_session,
+    save_long_term_memory, get_long_term_memory,  # 新增：读长期记忆
+    extract_and_save_long_term_memory,             # 新增：AI筛选
+    increment_message_count, reset_message_count   # 新增：计数器
+)
 from rag import search_documents, init_rag_data
 
 # 加载环境变量配置文件（从 .env 文件读取 API 密钥等配置）
@@ -21,6 +27,8 @@ ai_client = OpenAI(
 # 数据验证
 class ChatRequest(BaseModel):
     message: str
+    user_id:str
+    session_id:str
 
 @app.on_event("startup")
 async def startup():
@@ -29,10 +37,19 @@ async def startup():
     init_rag_data()  # 初始化示例知识库
 
 @app.get("/history")
-async def history(limit:int =20):
+async def history(user_id:str,session_id:str,limit:int =20):
     """获取历史消息"""
-    messages = await get_history(limit)
+    messages = await get_history(user_id, session_id, limit)
     return {"messages": messages}
+
+@app.delete("/chat/session")
+async def clear_chat_session(user_id:str,session_id:str):
+    """清空聊天会话"""
+    success=clear_session(user_id,session_id)
+    if success:
+        return {"message":f"会话{session_id}已清空"}
+    else:
+        return {"message":f"会话{session_id}不存在"}
 
 @app.get("/")
 def root():
@@ -45,41 +62,56 @@ def hello():
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """与 AI 对话（流式输出）"""
-    # 先保存用户消息
-    await save_message("user", request.message)
+    """与 AI 对话（流式输出）,支持记忆功能"""
+    # 先保存用户消息，把用户问题存入记忆
+    append_to_memory(request.user_id,request.session_id,"user",request.message)
     
     # 返回流式响应
     return StreamingResponse(
-        generate_ai_response(request.message),
+        generate_ai_response(request.user_id,request.session_id,request.message),
         media_type="text/plain"  # 纯文本流式输出
     )
 
 
-async def generate_ai_response(message: str):
+async def generate_ai_response(user_id: str, session_id: str, message: str):
     """流式生成 AI 回复，带RAG检索和异常处理"""
+    # 先把用户消息存了（不管AI是否成功，用户消息都要记录）
+    append_to_memory(user_id, session_id, "user", message)
+    await save_message(user_id, session_id, "user", message)
+    
     try:
-        # Step 1: RAG检索 - 先查相关知识库
+        # Step 1:先读短期记忆
+        history=get_hisory_from_memory(user_id,session_id)
+        #Step 1.5：再读长期记忆
+        long_memories=await get_long_term_memory(user_id,session_id)
+        if long_memories:
+            memory_context="以下是你之前记住的重要信息：\n" + "\n".join(long_memories)
+            history.insert(0, {"role": "system", "content": memory_context})
+
+        #Step 2: RAG检索 - 先查相关知识库
         relevant_docs = search_documents(message, n_results=2)
         context = "\n".join(relevant_docs) if relevant_docs else ""
         
-        # Step 2: 构建带上下文的提示词
-        if context:
-            prompt = f"""基于以下参考资料回答问题：
-
-参考资料：
-{context}
-
-用户问题：{message}
-
-请根据参考资料回答，如果资料中没有相关信息，请说明。"""
-        else:
-            prompt = message
+        # Step 3: 构建历史消息（历史+rag检索+新问题）
+        messages=history.copy() #1、先放历史记录
         
-        # Step 3: 调用 AI，开启流式输出
+        #2、如果有rag，加一条系统提示
+        if context:
+            messages.append({
+                "role":"system",
+                "content":f"参考资料：{context}\n请根据以上资料回答，如果资料中没有相关信息，请说明。"
+            })
+        
+        #3、最后加用户新问题
+        messages.append({
+            "role":"user",
+            "content":message
+        })
+        
+        # Step 4: 调用 AI，开启流式输出
         response = ai_client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V3",
-            messages=[{"role": "user", "content": prompt}],
+            model="Qwen/Qwen2.5-7B-Instruct",
+            messages=messages,
             stream=True  # 开启流式
         )
         
@@ -91,12 +123,15 @@ async def generate_ai_response(message: str):
                 full_reply += content
                 yield content  # 逐字返回给前端
         
-        # 流式输出完成后，保存完整回复到数据库
-        await save_message("assistant", full_reply)
+        # 流式输出完成后 ← 存到记忆字典里（短期记忆）
+        append_to_memory(user_id, session_id, "assistant", full_reply)  
+        # 同时存到数据库（长期存档，管理员用）
+        await save_message(user_id, session_id, "assistant", full_reply)
         
     except Exception as e:
         # 硅基流动错误码对照处理，用户无需查文档
         error_msg = str(e)
+        print(f"[AI错误] {error_msg}")  # 打印具体错误
         
         if "30001" in error_msg or "balance is insufficient" in error_msg:
             yield "【错误】账户余额不足，请充值或联系管理员"
@@ -104,15 +139,23 @@ async def generate_ai_response(message: str):
             yield "【错误】API 密钥无效，请检查 .env 文件配置"
         elif "30003" in error_msg:
             yield "【错误】请求参数错误，请检查输入内容"
-        elif "30004" in error_msg or "Model not found" in error_msg:
-            yield "【错误】模型不存在，请更换其他模型"
-        elif "429" in error_msg or "Rate limit" in error_msg:
-            yield "【错误】请求太频繁，请稍后再试"
-        elif "500" in error_msg:
-            yield "【错误】服务器繁忙，请稍后再试"
-        elif "503" in error_msg:
-            yield "【错误】服务暂不可用，请稍后再试"
+        elif "30004" in error_msg:
+            yield "【错误】模型不存在或不可用，请检查模型名称"
+        elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+            yield "【错误】请求超时，请稍后再试"
+        elif "connection" in error_msg.lower():
+            yield "【错误】网络连接异常，请检查网络设置"
         else:
-            yield "【错误】AI 服务异常，请稍后再试或联系管理员"
-
-
+            yield f"【错误】AI 服务异常，请稍后再试或联系管理员"
+        
+        # 即使AI失败，也要继续执行计数器逻辑
+        full_reply = ""
+    
+    # 计数器逻辑（不管AI是否成功，都要执行）
+    count=increment_message_count(user_id,session_id)
+    if count>=10:
+        #满了，触发AI筛选重要信息并存到长期记忆里去
+        await extract_and_save_long_term_memory(user_id, session_id)
+        #重置计数器
+        reset_message_count(user_id, session_id)
+        yield "【提示】已将会话内容中重要信息提取并保存到长期记忆中，以节省短期记忆空间。"
