@@ -18,4 +18,4 @@ venv/
 
 # Database files
 chroma_db/
-chat.db
+# chat.db  # 暂时提交数据库文件用于团队协作
