@@ -1,5 +1,6 @@
 #数据库操作块
-import aiosqlite
+import aiomysql
+from redis import asyncio as aioredis  # 新版 redis 的异步支持
 import traceback
 from openai import OpenAI
 import os
@@ -8,7 +9,17 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-DATABASE="chat.db"  #数据库文件名
+# MySQL 数据库配置
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "backend_training")
+
+# Redis 配置（新增）
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
 # AI 客户端（用来调用大模型筛选短期记忆中的重要信息作为长期存储）
 extract_client = OpenAI(
@@ -20,6 +31,53 @@ extract_client = OpenAI(
 # 结构： user_id: { session_id: [ {role, content}, ... ] } }
 memory_store = {}
 
+# 建立Redis连接池
+redis_pool=None
+
+async def get_redis():
+    """获取Redis连接"""
+    global redis_pool
+    if redis_pool is None:
+        redis_pool=aioredis.from_url(
+            f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}",
+            encoding="utf-8",
+            decode_responses=True
+        )
+    return redis_pool
+
+
+# 缓存相关函数
+
+# 获取缓存数据
+async def get_from_cache(key:str):
+    """从缓存获取数据"""
+    try:
+        redis=await get_redis()
+        data=await redis.get(key)
+        return data
+    except Exception as e:
+        print(f"【缓存】读取失败：{e}")
+        return None
+
+# 添加缓存并设置有效时间
+async def set_cache(key:str,value:str,expire:int=3600):
+    """设置缓存，默认1小时过期"""
+    try:
+        redis=await get_redis()   # 连接缓存
+        await redis.set(key,value,ex=expire) # 添加缓存
+        print(f"【缓存】已设置：{key}")
+    except Exception as e:
+        print(f"【缓存】设置失败：{e}")
+        return False
+
+# 删除缓存
+async def delete_cache(key:str):
+    """删除缓存"""
+    try:
+        redis=await get_redis()
+        await redis.delete(key)
+    except Exception as e:
+        print(f"【缓存】删除失败：{e}")
 
 # 计数器：只记录本轮对话发了多少条（和短期记忆分开）
 message_counter = {}
@@ -46,13 +104,15 @@ def reset_message_count(user_id: str, session_id: str):
 # 获取长期记忆
 async def get_long_term_memory(user_id: str, session_id: str) -> list:
     """获取某个用户的某个会话的长期记忆"""
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-            "SELECT memory_content FROM long_term_memories WHERE user_id=? AND session_id=? ORDER BY id DESC",
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "SELECT memory_content FROM long_term_memories WHERE user_id=%s AND session_id=%s ORDER BY id DESC",
             (user_id, session_id)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]  # 只返回内容列表
+        )
+        rows = await cursor.fetchall()
+        conn.close()
+        return [row[0] for row in rows]  # 只返回内容列表
 
 #ai 客户端提取重要信息存入长期记忆
 async def extract_and_save_long_term_memory(user_id: str, session_id: str):
@@ -107,12 +167,14 @@ async def extract_and_save_long_term_memory(user_id: str, session_id: str):
 # 长期记忆存储（数据库表里加一个）
 async def save_long_term_memory(user_id: str, session_id: str, memory_content: str):
     """保存长期记忆到数据库"""
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT INTO long_term_memories(user_id, session_id, memory_content) VALUES(?,?,?)",
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "INSERT INTO long_term_memories(user_id, session_id, memory_content) VALUES(%s,%s,%s)",
             (user_id, session_id, memory_content)
         )
-        await db.commit()
+        await conn.commit()
+    conn.close()
 
 def get_hisory_from_memory(user_id:str,session_id:str)->list:
     """从内存里拿某个用户的某个会话记录"""  #(短期字典记忆)
@@ -137,49 +199,119 @@ def clear_session(user_id:str,session_id:str):
 #连库建表
 async def init_db():
     """初始化数据库"""
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute("""
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        # 消息表
+        await cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,      -- 新增：用户标识
-        session_id TEXT NOT NULL,   -- 新增：会话标识
-        role TEXT NOT NULL,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL,
+        session_id VARCHAR(255) NOT NULL,
+        role VARCHAR(50) NOT NULL,
         content TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         
-        await db.execute("""
+        #长期记忆表
+        await cursor.execute("""
         CREATE TABLE IF NOT EXISTS long_term_memories(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id VARCHAR(255) NOT NULL,
+        session_id VARCHAR(255) NOT NULL,
         memory_content TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        await db.commit()
+
+        #用户表（存用户积分信息）
+        await cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id VARCHAR(255) UNIQUE NOT NULL,
+        credits INT DEFAULT 100,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        await conn.commit()
+    conn.close()
+    print("[数据库] 初始化完成")
+
+
+#获取用户积分（若是新用户则创建，赠送100积分）
+async def get_user_credits(user_id: str) -> int:
+    """获取用户当前积分，没有则创建默认100"""
+    conn=await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        #先查有没有这个用户
+        await cursor.execute("SELECT credits FROM users WHERE user_id=%s",(user_id,))
+        row=await cursor.fetchone()
+
+        if row:
+            credits=row[0]
+        else:
+            #没有就创建，默认100积分
+            await cursor.execute("INSERT INTO users(user_id,credits) VALUES(%s,100)",(user_id,))
+            await conn.commit()
+            credits=100
+            print(f"【积分】新用户 {user_id}创建，赠送100积分")
+        conn.close()
+        return credits
+
+#扣除用户积分
+async def deduct_credits(user_id: str, amount: int) -> bool:
+    """扣除用户积分，成功返回True，失败返回False"""
+    conn=await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        #1、先查用户当前积分
+        await cursor.execute("SELECT credits FROM users WHERE user_id=%s",(user_id,))
+        row=await cursor.fetchone()
+
+        if not row:
+            conn.close()
+            print(f"【积分】用户 {user_id} 不存在")
+            return False   #用户不存在
+        
+        current=row[0]
+        if current<amount:
+            conn.close()
+            print(f"【积分】用户 {user_id} 积分不足 {amount}，当前积分 {current}")
+            return False    #积分不够
+
+        #2、扣积分
+        new_credits=current-amount
+        await cursor.execute("UPDATE users SET credits=%s WHERE user_id=%s",(new_credits,user_id))
+        await conn.commit()
+        conn.close()
+        print(f"【积分】用户 {user_id} 扣除 {amount} 积分，剩余 {new_credits} 积分")
+        return True
+
 
 #保存消息
 async def save_message(user_id:str, session_id:str, role:str, content:str):
     """保存消息到数据库（用户隔离）"""
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "INSERT INTO messages(user_id, session_id,role,content) VALUES(?,?,?,?)",
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "INSERT INTO messages(user_id, session_id,role,content) VALUES(%s,%s,%s,%s)",
             (user_id, session_id, role, content)
         )
-        await db.commit()
+        await conn.commit()
+    conn.close()
 
 #获取历史消息记录
 async def get_history(user_id: str, session_id: str, limit: int =20):
     """获取某个用户的某个会话的历史消息"""
-    async with aiosqlite.connect(DATABASE) as db:
-        async with db.execute(
-           "SELECT role,content,created_at FROM messages WHERE user_id=? AND session_id=? ORDER BY id DESC LIMIT ?",
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+           "SELECT role,content,created_at FROM messages WHERE user_id=%s AND session_id=%s ORDER BY id DESC LIMIT %s",
             (user_id, session_id, limit)
-        ) as cursor:
-           rows=await cursor.fetchall()
-           return [
+        )
+        rows=await cursor.fetchall()
+        conn.close()
+        return [
             {"role":row[0],"content":row[1],"time":row[2]}
             for row in rows
-           ]
+        ]

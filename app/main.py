@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from httpx import get
 from pydantic import BaseModel
 from openai import OpenAI
 import os
@@ -10,14 +11,19 @@ from database import (
     get_hisory_from_memory, append_to_memory, clear_session,
     save_long_term_memory, get_long_term_memory,  # 新增：读长期记忆
     extract_and_save_long_term_memory,             # 新增：AI筛选
-    increment_message_count, reset_message_count   # 新增：计数器
+    increment_message_count, reset_message_count, # 新增：计数器
+    get_from_cache, set_cache, delete_cache ,        # 新增：缓存
+    get_user_credits,deduct_credits              # 新增：用户积分
 )
 from rag import search_documents, init_rag_data
+import json
+
 
 # 加载环境变量配置文件（从 .env 文件读取 API 密钥等配置）
 load_env_file()
 
 app = FastAPI()
+
 
 # 配置 CORS，允许所有来源访问（开发环境用，生产环境建议限制具体域名）
 app.add_middleware(
@@ -27,6 +33,7 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有方法
     allow_headers=["*"],  # 允许所有请求头
 )
+
 
 # AI 客户端配置（连接硅基流动大模型服务）
 ai_client = OpenAI(
@@ -40,17 +47,32 @@ class ChatRequest(BaseModel):
     user_id:str
     session_id:str
 
+
 @app.on_event("startup")
 async def startup():
     """服务启动时初始化数据库和RAG知识库"""
     await init_db()
     init_rag_data()  # 初始化示例知识库
 
+
 @app.get("/history")
 async def history(user_id:str,session_id:str,limit:int =20):
-    """获取历史消息"""
+    """获取历史消息（带缓存）"""
+    # 1. 先查缓存
+    cache_key = f"history:{user_id}:{session_id}"
+    cached = await get_from_cache(cache_key)
+    if cached:
+        print(f"[缓存命中] {cache_key}")
+        return {"messages": json.loads(cached), "from_cache": True}
+
+    # 2. 如果缓存中没有，则从数据库中获取
     messages = await get_history(user_id, session_id, limit)
-    return {"messages": messages}
+
+    # 3. 存入缓存（5分钟过期）
+    await set_cache(cache_key, json.dumps(messages), expire=300)
+
+    return {"messages": messages, "from_cache": False}
+
 
 @app.delete("/chat/session")
 async def clear_chat_session(user_id:str,session_id:str):
@@ -70,10 +92,41 @@ def root():
 def hello():
     return "hello world"
 
+@app.get("/credits")
+async def credits(user_id:str):
+    """查询用户积分"""
+    credits=await get_user_credits(user_id)
+    return {"user_id": user_id, "credits": credits}
+
+#敏感词列表
+SENSITIVE_WORDS={"傻逼","A片"}
+def check_sensitive_words(text:str)->bool:
+    """检查文本是否包含敏感词，有则返回True"""
+    for word in SENSITIVE_WORDS:
+      if word in text: 
+        return True
+    return False
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """与 AI 对话（流式输出）,支持记忆功能"""
-    # 先保存用户消息，把用户问题存入记忆
+    
+    #先检测有没有敏感词，通过了才能使用
+    if check_sensitive_words(request.message):
+        return {"error":"包含敏感词,已被拦截"}
+    
+    #1、积分（每次对话扣10积分）
+    cost=10
+    credits=await get_user_credits(request.user_id)
+    if credits<cost:
+        return {"error":"积分不足","current_credits":credits,"required":cost}
+   
+    #2、扣除积分
+    success=await deduct_credits(request.user_id,cost)
+    if not success:
+        return {"error":"积分扣除失败"}
+    
+    # 3、保存用户消息，把用户问题存入记忆
     append_to_memory(request.user_id,request.session_id,"user",request.message)
     
     # 返回流式响应
