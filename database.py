@@ -4,6 +4,7 @@ from redis import asyncio as aioredis  # 新版 redis 的异步支持
 import traceback
 from openai import OpenAI
 import os
+from logger import logger
 
 # 加载环境变量（确保能读到 API Key）
 from dotenv import load_dotenv
@@ -56,7 +57,7 @@ async def get_from_cache(key:str):
         data=await redis.get(key)
         return data
     except Exception as e:
-        print(f"【缓存】读取失败：{e}")
+        logger.warning("缓存读取失败: %s", e)
         return None
 
 # 添加缓存并设置有效时间
@@ -65,9 +66,9 @@ async def set_cache(key:str,value:str,expire:int=3600):
     try:
         redis=await get_redis()   # 连接缓存
         await redis.set(key,value,ex=expire) # 添加缓存
-        print(f"【缓存】已设置：{key}")
+        logger.info("缓存已设置: %s", key)
     except Exception as e:
-        print(f"【缓存】设置失败：{e}")
+        logger.warning("缓存设置失败: %s", e)
         return False
 
 # 删除缓存
@@ -77,7 +78,7 @@ async def delete_cache(key:str):
         redis=await get_redis()
         await redis.delete(key)
     except Exception as e:
-        print(f"【缓存】删除失败：{e}")
+        logger.warning("缓存删除失败: %s", e)
 
 # 计数器：只记录本轮对话发了多少条（和短期记忆分开）
 message_counter = {}
@@ -122,7 +123,7 @@ async def extract_and_save_long_term_memory(user_id: str, session_id: str):
         history=await get_history(user_id, session_id, limit=10)
         
         if not history:
-            print(f"[长期记忆] 没有历史记录，跳过提取")
+            logger.info("长期记忆: 没有历史记录，跳过提取")
             return
         
         #2、拼接成文本
@@ -138,7 +139,7 @@ async def extract_and_save_long_term_memory(user_id: str, session_id: str):
 
     请用简洁单独一句话总结每条重要信息,每行一条：
     """
-        print(f"[长期记忆] 调用AI提取，历史记录数: {len(history)}")
+        logger.info("长期记忆: 调用AI提取，历史记录数: %s", len(history))
         
         response=extract_client.chat.completions.create(
             model="Qwen/Qwen2.5-7B-Instruct",
@@ -146,7 +147,7 @@ async def extract_and_save_long_term_memory(user_id: str, session_id: str):
             stream=False,
         )
         result=response.choices[0].message.content.strip()
-        print(f"[长期记忆] AI返回: {result}")
+        logger.debug("长期记忆: AI返回: %s", result)
 
         #4、如果有重要信息，存入长期记忆
         if result and result !="无":
@@ -156,11 +157,11 @@ async def extract_and_save_long_term_memory(user_id: str, session_id: str):
                 if memory:
                     await save_long_term_memory(user_id, session_id, memory)
                     count += 1
-            print(f"[长期记忆] 成功保存 {count} 条")
+            logger.info("长期记忆: 成功保存 %s 条", count)
         else:
-            print(f"[长期记忆] AI认为没有重要信息")
+            logger.info("长期记忆: AI认为没有重要信息")
     except Exception as e:
-        print(f"[长期记忆] 提取失败: {e}")
+        logger.error("长期记忆: 提取失败: %s", e)
        
         traceback.print_exc()
 
@@ -189,12 +190,27 @@ def append_to_memory(user_id:str,session_id:str,role:str,content:str):
       #追加消息
     memory_store[user_id][session_id].append({"role":role,"content":content})
 
-def clear_session(user_id:str,session_id:str):
-    """清空某个会话的记忆（新建会话时用）"""
+async def clear_session(user_id:str,session_id:str):
+    """清空某个会话的记忆和数据库记录"""
+    #1、删除内存中的短期记忆
     if user_id in memory_store and session_id in memory_store[user_id]:
         del memory_store[user_id][session_id]
-        return True
-    return False
+    
+    #2、删除数据库中的记录
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            "DELETE FROM messages WHERE user_id=%s AND session_id=%s",
+            (user_id, session_id)
+        )
+        await conn.commit()
+    conn.close()
+    
+    #3、删除Redis缓存
+    cache_key = f"history:{user_id}:{session_id}"
+    await delete_cache(cache_key)
+    
+    return True
     
 #连库建表
 async def init_db():
@@ -236,7 +252,7 @@ async def init_db():
 
         await conn.commit()
     conn.close()
-    print("[数据库] 初始化完成")
+    logger.info("数据库初始化完成")
 
 
 #获取用户积分（若是新用户则创建，赠送100积分）
@@ -255,7 +271,7 @@ async def get_user_credits(user_id: str) -> int:
             await cursor.execute("INSERT INTO users(user_id,credits) VALUES(%s,100)",(user_id,))
             await conn.commit()
             credits=100
-            print(f"【积分】新用户 {user_id}创建，赠送100积分")
+            logger.info("新用户 %s 创建，赠送100积分", user_id)
         conn.close()
         return credits
 
@@ -270,13 +286,13 @@ async def deduct_credits(user_id: str, amount: int) -> bool:
 
         if not row:
             conn.close()
-            print(f"【积分】用户 {user_id} 不存在")
+            logger.warning("用户 %s 不存在", user_id)
             return False   #用户不存在
         
         current=row[0]
         if current<amount:
             conn.close()
-            print(f"【积分】用户 {user_id} 积分不足 {amount}，当前积分 {current}")
+            logger.warning("用户 %s 积分不足 %s，当前积分 %s", user_id, amount, current)
             return False    #积分不够
 
         #2、扣积分
@@ -284,8 +300,31 @@ async def deduct_credits(user_id: str, amount: int) -> bool:
         await cursor.execute("UPDATE users SET credits=%s WHERE user_id=%s",(new_credits,user_id))
         await conn.commit()
         conn.close()
-        print(f"【积分】用户 {user_id} 扣除 {amount} 积分，剩余 {new_credits} 积分")
+        logger.info("用户 %s 扣除 %s 积分，剩余 %s 积分", user_id, amount, new_credits)
         return True
+
+
+#增加用户积分
+async def add_credits(user_id: str, amount: int) -> int:
+    """给用户增加积分，返回增加后的总积分"""
+    conn = await aiomysql.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+    async with conn.cursor() as cursor:
+        #1、查当前积分
+        await cursor.execute("SELECT credits FROM users WHERE user_id=%s", (user_id,))
+        result = await cursor.fetchone()
+
+        if result:
+            current = result[0]
+            new_credits = current + amount
+            await cursor.execute("UPDATE users SET credits=%s WHERE user_id=%s", (new_credits, user_id))
+        else:
+            # 用户不存在，先创建（给100）再加
+            new_credits = 100 + amount
+            await cursor.execute("INSERT INTO users (user_id, credits) VALUES (%s, %s)", (user_id, new_credits))
+        await conn.commit()
+        conn.close()
+        logger.info("用户 %s 增加 %s 积分，当前 %s 积分", user_id, amount, new_credits)
+        return new_credits
 
 
 #保存消息
@@ -312,6 +351,6 @@ async def get_history(user_id: str, session_id: str, limit: int =20):
         rows=await cursor.fetchall()
         conn.close()
         return [
-            {"role":row[0],"content":row[1],"time":row[2]}
+            {"role":row[0],"content":row[1],"time":row[2].strftime("%Y-%m-%d %H:%M:%S") if row[2] else None}
             for row in rows
         ]

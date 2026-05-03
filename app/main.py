@@ -4,6 +4,8 @@ from httpx import get
 from pydantic import BaseModel
 from openai import OpenAI
 import os
+from logger import logger
+import time
 from dotenv import load_dotenv as load_env_file
 from fastapi.responses import StreamingResponse
 from database import (
@@ -13,7 +15,7 @@ from database import (
     extract_and_save_long_term_memory,             # 新增：AI筛选
     increment_message_count, reset_message_count, # 新增：计数器
     get_from_cache, set_cache, delete_cache ,        # 新增：缓存
-    get_user_credits,deduct_credits              # 新增：用户积分
+    get_user_credits,deduct_credits,add_credits  # 新增：用户积分
 )
 from rag import search_documents, init_rag_data
 import json
@@ -62,7 +64,7 @@ async def history(user_id:str,session_id:str,limit:int =20):
     cache_key = f"history:{user_id}:{session_id}"
     cached = await get_from_cache(cache_key)
     if cached:
-        print(f"[缓存命中] {cache_key}")
+        logger.debug("缓存命中：%s",cache_key)
         return {"messages": json.loads(cached), "from_cache": True}
 
     # 2. 如果缓存中没有，则从数据库中获取
@@ -77,7 +79,7 @@ async def history(user_id:str,session_id:str,limit:int =20):
 @app.delete("/chat/session")
 async def clear_chat_session(user_id:str,session_id:str):
     """清空聊天会话"""
-    success=clear_session(user_id,session_id)
+    success=await clear_session(user_id,session_id)
     if success:
         return {"message":f"会话{session_id}已清空"}
     else:
@@ -109,38 +111,45 @@ def check_sensitive_words(text:str)->bool:
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    start_time=time.time() #会话开始时间
     """与 AI 对话（流式输出）,支持记忆功能"""
-    
+
     #先检测有没有敏感词，通过了才能使用
     if check_sensitive_words(request.message):
         return {"error":"包含敏感词,已被拦截"}
+
+    logger.info("用户 %s调用/chat，消息：%s",request.user_id,request.message[:20])
+    
+
     
     #1、积分（每次对话扣10积分）
     cost=10
     credits=await get_user_credits(request.user_id)
     if credits<cost:
         return {"error":"积分不足","current_credits":credits,"required":cost}
-   
     #2、扣除积分
     success=await deduct_credits(request.user_id,cost)
     if not success:
         return {"error":"积分扣除失败"}
     
-    # 3、保存用户消息，把用户问题存入记忆
+    # 3、保存用户消息，把用户问题存入记忆和数据库
     append_to_memory(request.user_id,request.session_id,"user",request.message)
+    await save_message(request.user_id, request.session_id, "user", request.message)
     
     # 返回流式响应
     return StreamingResponse(
-        generate_ai_response(request.user_id,request.session_id,request.message),
+        generate_ai_response(request.user_id,request.session_id,request.message,cost),
         media_type="text/plain",  # 纯文本流式输出
         headers={
             "Cache-Control": "no-cache",  # 禁用缓存，确保实时输出
             "X-Accel-Buffering": "no"     # 禁用 Nginx 等代理的缓冲
         }
     )
+    cost_time=time.time()-start_time  #会话耗时
+    logger.info("/chat 接口耗时: %.3f秒", cost_time)  # 打印会话耗时
 
 
-async def generate_ai_response(user_id: str, session_id: str, message: str):
+async def generate_ai_response(user_id: str, session_id: str, message: str, cost: int = 10):
     """流式生成 AI 回复，带RAG检索和异常处理"""
     # 注意：用户消息已在 chat() 函数中保存，这里不再重复保存
     
@@ -195,9 +204,13 @@ async def generate_ai_response(user_id: str, session_id: str, message: str):
         await save_message(user_id, session_id, "assistant", full_reply)
         
     except Exception as e:
+        # AI调用失败，退还积分
+        await add_credits(user_id, cost)
+        logger.warning("用户 %s AI调用失败，退还 %s 积分", user_id, cost)
+        
         # 硅基流动错误码对照处理，用户无需查文档
         error_msg = str(e)
-        print(f"[AI错误] {error_msg}")  # 打印具体错误
+        logger.error("AI 调用失败: %s", error_msg)
         
         if "30001" in error_msg or "balance is insufficient" in error_msg:
             yield "【错误】账户余额不足，请充值或联系管理员"

@@ -15,4 +15,8 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url))
     },
   },
+  server:{
+    host: '0.0.0.0',
+    allowedHosts: true  // 允许所有域名访问
+  }
 })
